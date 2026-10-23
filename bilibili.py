@@ -56,7 +56,8 @@ class BilibiliTask:
     def get_dynamic_videos(self):
         # 原接口 x/web-interface/dynamic/region 已下线(返回-404 啥都木有)
         # 改用分区最新视频接口 newlist，返回结构同为 data.archives
-        url = 'https://api.bilibili.com/x/web-interface/newlist?rid=1&type=0&ps=5&pn=1'
+        # ps=20: 扩大候选池，跳过已投过硬币的视频后仍能投满目标枚数
+        url = 'https://api.bilibili.com/x/web-interface/newlist?rid=1&type=0&ps=20&pn=1'
         try:
             data = self._request('GET', url)
             if data['code'] == 0:
@@ -68,8 +69,8 @@ class BilibiliTask:
             return []
 
     def get_popular_videos(self):
-        # 综合热门视频(投币视频源回退备选)
-        url = 'https://api.bilibili.com/x/web-interface/popular?ps=5&pn=1'
+        # 综合热门视频(投币视频源回退备选)，ps=20 扩大候选池
+        url = 'https://api.bilibili.com/x/web-interface/popular?ps=20&pn=1'
         try:
             data = self._request('GET', url)
             if data['code'] == 0:
@@ -101,6 +102,19 @@ class BilibiliTask:
             return False
         except Exception:
             return False
+
+    def get_today_coin_exp(self):
+        """查询今日已获得的投币经验(x/member/web/exp/reward 的 data.coin，上限50=每日5枚)
+        返回 int；查询失败返回 None"""
+        try:
+            data = self._request('GET', 'https://api.bilibili.com/x/member/web/exp/reward')
+            if data['code'] == 0:
+                return int(data.get('data', {}).get('coin', 0))
+            logger.warning(f"查询今日投币经验失败: {data.get('message')}")
+            return None
+        except Exception as e:
+            logger.error(f"请求今日经验API异常: {e}")
+            return None
 
     def add_coin(self, bvid, num=1, select_like=1):
         if not self.csrf: return False, "Bili_jct(csrf) 未找到"

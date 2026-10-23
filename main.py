@@ -7,6 +7,10 @@ from loguru import logger
 from bilibili import BilibiliTask
 from push import format_push_message, send_to_pushplus
 
+# B站每日投币经验上限：每枚硬币+10经验，最多5枚(50经验)
+COIN_EXP_LIMIT = 50
+COIN_NUM_LIMIT = 5
+
 # 任务间随机间隔(1~2秒)，避免请求过快触发B站风控
 def task_interval():
     time.sleep(random.uniform(1, 2))
@@ -52,16 +56,50 @@ def get_coin_target_videos(bili, source):
         logger.warning(f"视频源 '{src}' 获取失败，尝试回退到其他视频源...")
     return None, []
 
+def resolve_coin_target(bili, config):
+    """解析今日投币目标枚数
+    - COIN_ADD_NUM='max'(默认): 自动投满每日经验上限，先查今日已得投币经验只补投差额
+    - 数字N: 固定投N枚(上限5)
+    - '0': 关闭投币
+    返回 (目标枚数, 今日已得投币经验或None)"""
+    raw = str(config.get('COIN_ADD_NUM', 'max')).strip().lower()
+    if raw == '0':
+        return 0, None
+    if raw in ('max', 'auto', '-1', ''):
+        today_exp = bili.get_today_coin_exp()
+        if today_exp is None:
+            # 经验查询失败，退化为按固定上限投
+            return COIN_NUM_LIMIT, today_exp
+        target = max(0, (COIN_EXP_LIMIT - today_exp) // 10)
+        return target, today_exp
+    try:
+        return min(int(raw), COIN_NUM_LIMIT), None
+    except ValueError:
+        logger.warning(f"COIN_ADD_NUM 配置无效('{raw}')，按自动投满处理。")
+        today_exp = bili.get_today_coin_exp()
+        if today_exp is None:
+            return COIN_NUM_LIMIT, today_exp
+        return max(0, (COIN_EXP_LIMIT - today_exp) // 10), today_exp
+
 def execute_coin_task(bili, user_info, config):
-    coins_to_add = int(config.get('COIN_ADD_NUM'))
-    if coins_to_add <= 0:
+    coins_to_add, today_coin_exp = resolve_coin_target(bili, config)
+    if coins_to_add == 0:
+        if today_coin_exp is not None:
+            return True, f"今日投币经验已得{today_coin_exp}/{COIN_EXP_LIMIT}，无需补投，跳过"
         return True, "配置为0，跳过"
     
     coin_balance = user_info.get('money', 0)
     if coin_balance < 1:
         return True, f"硬币不足({coin_balance})，跳过"
     
-    coins_to_add = min(coins_to_add, int(coin_balance), 5)
+    actual_target = min(coins_to_add, int(coin_balance), COIN_NUM_LIMIT)
+    if actual_target < coins_to_add:
+        logger.warning(f"硬币余额不足({coin_balance})，计划投 {coins_to_add} 枚改为 {actual_target} 枚。")
+
+    if today_coin_exp is not None:
+        logger.info(f"今日已得投币经验 {today_coin_exp}/{COIN_EXP_LIMIT}，本次计划投 {actual_target} 枚。")
+    else:
+        logger.info(f"本次计划投 {actual_target} 枚。")
 
     source = config.get('COIN_VIDEO_SOURCE')
     actual_source, video_list = get_coin_target_videos(bili, source)
@@ -73,24 +111,31 @@ def execute_coin_task(bili, user_info, config):
 
     added_coins = 0
     for bvid in video_list:
-        if added_coins >= coins_to_add:
+        if added_coins >= actual_target:
             break
         
         success, msg = bili.add_coin(bvid, 1, int(config.get('COIN_SELECT_LIKE')))
         if success:
             added_coins += 1
-            logger.info(f"为视频 {bvid} 投币成功。")
+            logger.info(f"为视频 {bvid} 投币成功({added_coins}/{actual_target})。")
         elif "上限" in msg or "已达到" in msg:
             logger.warning("今日投币上限已满，终止投币。")
-            return True, f"今日投币已达上限，成功 {added_coins} 枚"
+            break
+        elif "投过" in msg or "重复" in msg:
+            # 该视频今日已投过硬币，换下一个候选视频
+            logger.info(f"视频 {bvid} 已投过硬币，换下一个候选。")
         else:
             logger.warning(f"为视频 {bvid} 投币失败: {msg}")
-            if "硬币不足" in msg or "不足" in msg:
+            if "不足" in msg:
                 break
         # 投币间随机间隔，避免连续快速操作触发风控
         time.sleep(random.uniform(1, 2))
 
-    return True, f"尝试投币，最终成功 {added_coins} 枚"
+    if added_coins >= actual_target:
+        return True, f"今日投币完成，成功 {added_coins} 枚(+{added_coins * 10}经验)"
+    if added_coins == 0:
+        return False, f"投币未能完成(0/{actual_target})"
+    return True, f"尝试投币，成功 {added_coins}/{actual_target} 枚"
 
 def run_all_tasks_for_account(bili, config):
     tasks_to_run = [task.strip() for task in config.get('TASK_CONFIG', '').split(',') if task.strip()]
@@ -134,7 +179,7 @@ def main():
         "BILIBILI_COOKIE": os.environ.get('BILIBILI_COOKIE'),
         "PUSH_PLUS_TOKEN": os.environ.get('PUSH_PLUS_TOKEN'),
         "TASK_CONFIG": os.environ.get('TASK_CONFIG') or 'manga_sign,share_video,add_coin',
-        "COIN_ADD_NUM": os.environ.get('COIN_ADD_NUM') or '1',
+        "COIN_ADD_NUM": os.environ.get('COIN_ADD_NUM') or 'max',
         "COIN_SELECT_LIKE": os.environ.get('COIN_SELECT_LIKE') or '1',
         "COIN_VIDEO_SOURCE": os.environ.get('COIN_VIDEO_SOURCE') or 'dynamic'
     }
